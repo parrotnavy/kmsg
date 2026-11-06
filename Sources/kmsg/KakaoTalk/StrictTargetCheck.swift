@@ -53,31 +53,33 @@ struct StrictTargetCheck {
             }
         }
         if includeTranscript && !expectRecent.isEmpty {
-            // Only the newest messages matter, so read a short tail; retry once while a fresh window renders.
+            // Only the newest messages matter: read a short tail first, then a longer one before giving up
+            // (a photo row or a window not scrolled to the bottom can push them out of the short tail).
             let reader = KakaoTalkTranscriptReader(kakao: kakao, runner: AXActionRunner(traceEnabled: traceAX))
-            var snapshot: TranscriptSnapshot?
+            var missing = expectRecent
+            var bodyCount = 0
             var lastError: Error?
-            for attempt in 0..<2 {
-                if attempt > 0 { Thread.sleep(forTimeInterval: 1.0) }
-                do {
-                    snapshot = try reader.readSnapshot(from: window, fallbackChatTitle: expectTitle, limit: 8)
-                    break
-                } catch {
-                    lastError = error
+            for limit in [8, 16] {
+                guard let snapshot = try? reader.readSnapshot(from: window, fallbackChatTitle: expectTitle, limit: limit) else {
+                    lastError = TranscriptReadError.noMessageRows
+                    Thread.sleep(forTimeInterval: 1.0)
+                    continue
                 }
-            }
-            guard let snapshot else {
-                throw fail("could not read the chat transcript (\(lastError.map { "\($0)" } ?? "unknown"))")
-            }
-            let bodies = snapshot.messages.map { Self.normalizeForMatch($0.body) }.filter { !$0.isEmpty }
-            let missing = expectRecent.filter { expected in
-                let want = Self.normalizeForMatch(expected)
-                return !bodies.contains { body in
-                    body == want || body.contains(want) || (body.count >= 8 && want.hasPrefix(body))
+                let bodies = snapshot.messages.map { Self.normalizeForMatch($0.body) }.filter { !$0.isEmpty }
+                bodyCount = bodies.count
+                missing = expectRecent.filter { expected in
+                    let want = Self.normalizeForMatch(expected)
+                    return !bodies.contains { body in
+                        body == want || body.contains(want) || (body.count >= 8 && want.hasPrefix(body))
+                    }
                 }
+                if missing.isEmpty { break }
+            }
+            if bodyCount == 0, let lastError {
+                throw fail("could not read the chat transcript (\(lastError))")
             }
             guard missing.isEmpty else {
-                throw fail("\(missing.count) of \(expectRecent.count) expected recent messages are not in the window transcript (\(bodies.count) messages read)")
+                throw fail("\(missing.count) of \(expectRecent.count) expected recent messages are not in the window transcript (\(bodyCount) messages read)")
             }
             print("✓ Transcript matches \(expectRecent.count) expected recent message(s) \(stage)")
         }
