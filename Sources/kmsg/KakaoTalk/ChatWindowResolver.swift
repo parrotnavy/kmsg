@@ -208,7 +208,7 @@ struct ChatWindowResolver {
             return ChatWindowResolution(window: window, method: .existingWindow)
         }
 
-        guard let chatListWindow = kakao.chatListWindow else {
+        guard let chatListWindow = kakao.chatListWindow ?? reopenChatListWindow() else {
             throw KakaoTalkError.windowNotFound("[\(ChatWindowFailureCode.windowNotReady.rawValue)] chat list window not found")
         }
         // Titles only, recent rows first: the target is almost always near the top. Read deeper
@@ -324,6 +324,39 @@ struct ChatWindowResolver {
         _ = tryRaiseWindow(chatListWindow)
         Thread.sleep(forTimeInterval: 0.1)
         runner.mouseDoubleClick(at: point, label: "strict chat list row")
+    }
+
+    /// The main window can be closed while chat windows stay open; reopening the app does not bring
+    /// it back. Open it from the menu bar ("창" > "채팅", or "Window" > "Chats") and wait for it.
+    private func reopenChatListWindow() -> UIElement? {
+        kakao.activate()
+        Thread.sleep(forTimeInterval: 0.3)
+        let app = kakao.applicationElement
+        guard let menuBarRef: AXUIElement = app.attributeOptional(kAXMenuBarAttribute) else {
+            runner.log("strict: menu bar not found")
+            return nil
+        }
+        let menuBar = UIElement(menuBarRef)
+        guard let windowMenu = menuBar.children.first(where: { ["창", "Window"].contains($0.title ?? "") }) else {
+            runner.log("strict: window menu not found")
+            return nil
+        }
+        let items = windowMenu.children.flatMap { $0.children }
+        guard let chatsItem = items.first(where: { item in
+            let title = (item.title ?? "").trimmingCharacters(in: .whitespaces)
+            return title == "채팅" || title == "Chats"
+        }) else {
+            runner.log("strict: chats menu item not found")
+            return nil
+        }
+        try? chatsItem.press()
+        var window: UIElement?
+        _ = runner.waitUntil(label: "chat list window", timeout: 3.0, pollInterval: 0.1, evaluateAfterTimeout: true) {
+            window = kakao.chatListWindow
+            return window != nil
+        }
+        runner.log("strict: reopened chat list window via menu: \(window != nil)")
+        return window
     }
 
     /// The main window may be on the Friends tab; strict lookups must read the chat list.
