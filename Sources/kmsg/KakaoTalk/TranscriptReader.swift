@@ -183,7 +183,9 @@ struct KakaoTalkTranscriptReader {
         messageLimit: Int,
         frameCache: FrameCache
     ) -> [UIElement] {
-        let targetRowCount = max(messageLimit * 4, 50)
+        // A small limit (e.g. a strict send checking the newest few messages) reads a short tail only.
+        let compact = messageLimit <= 10
+        let targetRowCount = compact ? max(messageLimit * 3, 20) : max(messageLimit * 4, 50)
         var rows: [UIElement] = []
 
         rows.append(contentsOf: directRowChildren(from: transcriptRoot))
@@ -200,7 +202,7 @@ struct KakaoTalkTranscriptReader {
         if rows.count < targetRowCount {
             let bfsRows = transcriptRoot.findAll(
                 role: kAXRowRole,
-                limit: max(targetRowCount * 3, 240),
+                limit: compact ? targetRowCount * 3 : max(targetRowCount * 3, 240),
                 maxNodes: 3_000
             )
             rows.append(contentsOf: bfsRows)
@@ -231,7 +233,7 @@ struct KakaoTalkTranscriptReader {
             return lhsY < rhsY
         }
 
-        let recentWindow = max(messageLimit * 6, 80)
+        let recentWindow = compact ? max(messageLimit * 3, 24) : max(messageLimit * 6, 80)
         let recentRows = Array(sorted.suffix(recentWindow))
         runner.log("read: transcript rows raw=\(rows.count), unique=\(deduplicated.count), filtered=\(sorted.count), recent=\(recentRows.count)")
         return recentRows
@@ -245,7 +247,7 @@ struct KakaoTalkTranscriptReader {
         referenceDate: Date,
         frameCache: FrameCache
     ) -> [TranscriptMessage] {
-        let analysisBudget = max(limit * 5, 60)
+        let analysisBudget = limit <= 10 ? max(limit * 3, 24) : max(limit * 5, 60)
         let rowsToAnalyze = Array(rows.suffix(analysisBudget))
         let analyses = rowsToAnalyze.map {
             analyzeRow($0, transcriptRoot: transcriptRoot, referenceDate: referenceDate, frameCache: frameCache)

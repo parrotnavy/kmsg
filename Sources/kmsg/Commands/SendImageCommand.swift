@@ -14,6 +14,21 @@ struct SendImageCommand: ParsableCommand {
     @Argument(help: "Path to the image file")
     var imagePath: String
 
+    @Option(
+        name: .long,
+        help: "Strict mode: send only to the one chat titled exactly this. Ambiguity or mismatch aborts; the target is re-checked right before pasting and right before the send button."
+    )
+    var expectTitle: String?
+
+    @Option(
+        name: .long,
+        help: "Strict mode (with --expect-title): a recent message of the target chat. Repeatable. Every one must appear in the window transcript."
+    )
+    var expectRecent: [String] = []
+
+    @Flag(name: .long, help: "Don't actually send, just show what would happen")
+    var dryRun: Bool = false
+
     @Flag(name: .long, help: "Show AX traversal and retry details")
     var traceAX: Bool = false
 
@@ -26,7 +41,30 @@ struct SendImageCommand: ParsableCommand {
     @Flag(name: .long, help: "Enable deep window recovery when fast window detection fails")
     var deepRecovery: Bool = false
 
+    func validate() throws {
+        if !expectRecent.isEmpty && expectTitle == nil {
+            throw ValidationError("--expect-recent requires --expect-title.")
+        }
+    }
+
+    private var strictCheck: StrictTargetCheck? {
+        expectTitle.map { StrictTargetCheck(expectTitle: $0, expectRecent: expectRecent, traceAX: traceAX) }
+    }
+
     func run() throws {
+        if dryRun {
+            print("Dry run mode - no image will be sent")
+            print("Recipient: \(recipient)")
+            print("Image: \(imagePath)")
+            if let expectTitle {
+                print("Expect title: \(expectTitle)")
+            }
+            if !expectRecent.isEmpty {
+                print("Expect recent messages: \(expectRecent.count)")
+            }
+            return
+        }
+
         guard AccessibilityPermission.ensureGranted() else {
             AccessibilityPermission.printInstructions()
             throw ExitCode.failure
@@ -45,12 +83,15 @@ struct SendImageCommand: ParsableCommand {
             kakao: kakao,
             runner: runner,
             useCache: !noCache,
-            deepRecoveryEnabled: deepRecovery
+            deepRecoveryEnabled: deepRecovery,
+            expectedTitle: expectTitle
         )
 
+        var openedResolution: ChatWindowResolution?
         do {
             print("Looking for chat with '\(recipient)'...")
             let resolution = try chatWindowResolver.resolve(query: recipient)
+            openedResolution = resolution
 
             try sendImageToWindow(imageURL, window: resolution.window, kakao: kakao, runner: runner)
             closeWindowsIfNeeded(
@@ -61,6 +102,9 @@ struct SendImageCommand: ParsableCommand {
             )
         } catch {
             print("Failed to send image: \(error)")
+            if expectTitle != nil, !keepWindow, let openedResolution, openedResolution.openedTransiently {
+                _ = chatWindowResolver.closeWindow(openedResolution.window)
+            }
             throw ExitCode.failure
         }
     }
@@ -71,16 +115,27 @@ struct SendImageCommand: ParsableCommand {
             throw KakaoTalkError.actionFailed("Failed to load image from \(imageURL.path)")
         }
 
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.writeObjects([image])
-
-        runner.log("Image copied to clipboard")
-
         // 2. Activate KakaoTalk and focus window
         kakao.activate()
         try? window.focus()
         Thread.sleep(forTimeInterval: 0.3)
+
+        try strictCheck?.verify(window, kakao: kakao, stage: "before paste")
+        if strictCheck != nil {
+            // The transcript read can take seconds and move focus; bring the chat back, re-check cheaply.
+            kakao.activate()
+            try? window.focus()
+            Thread.sleep(forTimeInterval: 0.2)
+            try strictCheck?.verify(window, kakao: kakao, stage: "at paste", includeTranscript: false)
+        }
+
+        let pasteboard = NSPasteboard.general
+        let savedItems = Self.snapshotPasteboard(pasteboard)
+        defer { Self.restorePasteboard(pasteboard, items: savedItems) }
+        pasteboard.clearContents()
+        pasteboard.writeObjects([image])
+
+        runner.log("Image copied to clipboard")
 
         // 3. Paste image
         runner.pressPaste()
@@ -92,6 +147,10 @@ struct SendImageCommand: ParsableCommand {
             Thread.sleep(forTimeInterval: 0.2)
 
             guard let button = findSendButton(in: confirmationSheet) else {
+                if strictCheck != nil {
+                    runner.pressEscape()
+                    throw KakaoTalkError.elementNotFound("[TARGET_MISMATCH] send button not found on the confirmation sheet; strict mode does not guess")
+                }
                 if !waitForSendCompletion(in: window, confirmationSheet: confirmationSheet, runner: runner) {
                     throw KakaoTalkError.elementNotFound("Send button not found on confirmation sheet")
                 }
@@ -101,12 +160,22 @@ struct SendImageCommand: ParsableCommand {
                 return
             }
 
+            do {
+                try strictCheck?.verify(window, kakao: kakao, stage: "before send button", attachedSheet: confirmationSheet, includeTranscript: false)
+            } catch {
+                runner.pressEscape()
+                throw error
+            }
+
             if !runner.clickWithRetry(button, label: "send button"),
                !waitForSendCompletion(in: window, confirmationSheet: confirmationSheet, runner: runner)
             {
                 throw KakaoTalkError.actionFailed("Failed to click send button after retries")
             }
         } else {
+            if strictCheck != nil {
+                throw KakaoTalkError.actionFailed("[TARGET_MISMATCH] confirmation sheet did not appear; strict mode cannot verify before sending")
+            }
             runner.log("send-image: confirmation sheet not observed; allowing direct-send path")
             Thread.sleep(forTimeInterval: 0.7)
         }
@@ -115,6 +184,27 @@ struct SendImageCommand: ParsableCommand {
 
         // Give it a moment to finish sending
         Thread.sleep(forTimeInterval: 0.5)
+    }
+
+    private static func snapshotPasteboard(_ pasteboard: NSPasteboard) -> [NSPasteboardItem] {
+        (pasteboard.pasteboardItems ?? []).map { item in
+            let copy = NSPasteboardItem()
+            for type in item.types {
+                if let data = item.data(forType: type) {
+                    copy.setData(data, forType: type)
+                }
+            }
+            return copy
+        }
+    }
+
+    private static func restorePasteboard(_ pasteboard: NSPasteboard, items: [NSPasteboardItem]) {
+        // Give KakaoTalk time to read the pasted image before the clipboard changes back.
+        Thread.sleep(forTimeInterval: 0.5)
+        pasteboard.clearContents()
+        if !items.isEmpty {
+            pasteboard.writeObjects(items)
+        }
     }
 
     private func closeWindowsIfNeeded(

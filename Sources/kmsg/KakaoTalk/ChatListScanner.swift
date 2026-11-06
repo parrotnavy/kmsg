@@ -72,7 +72,12 @@ struct ChatListSnapshotItem {
 }
 
 struct ChatListScanner {
-    func scan(in window: UIElement, limit: Int, trace: ((String) -> Void)? = nil) -> [ChatListSnapshotItem] {
+    func scan(
+        in window: UIElement,
+        limit: Int,
+        includePreview: Bool = true,
+        trace: ((String) -> Void)? = nil
+    ) -> [ChatListSnapshotItem] {
         guard let container = resolveChatListContainer(in: window, trace: trace) else {
             trace?("chats: chat list container unavailable")
             return []
@@ -89,7 +94,8 @@ struct ChatListScanner {
 
         for (index, row) in rows.enumerated() {
             let title = extractTitle(from: row, trace: trace)
-            let preview = extractPreview(from: row, title: title, trace: trace)
+            // Previews cost an extra AX walk per row; title-only callers skip them.
+            let preview = includePreview ? extractPreview(from: row, title: title, trace: trace) : nil
             let discovery = ChatListDiscovery(title: title, lastMessage: preview, listIndex: index)
             snapshots.append(ChatListSnapshotItem(element: row, discovery: discovery))
         }

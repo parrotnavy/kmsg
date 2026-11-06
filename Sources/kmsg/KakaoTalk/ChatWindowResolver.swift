@@ -47,6 +47,8 @@ private enum ChatWindowFailureCode: String {
     case inputNotReflected = "INPUT_NOT_REFLECTED"
     case windowNotReady = "WINDOW_NOT_READY"
     case searchMiss = "SEARCH_MISS"
+    case ambiguousTarget = "AMBIGUOUS_TARGET"
+    case targetMismatch = "TARGET_MISMATCH"
 }
 
 private struct SearchScanProfile {
@@ -84,6 +86,9 @@ struct ChatWindowResolver {
     private let deepRecoveryEnabled: Bool
     private let layoutMode: ChatWindowLayoutMode
     private let interactionMode: ChatWindowInteractionMode
+    /// When set, the target must be the one chat whose title is exactly this string.
+    /// No fuzzy matching, no search fallback; ambiguity or mismatch aborts.
+    private let expectedTitle: String?
 
     init(
         kakao: KakaoTalkApp,
@@ -91,8 +96,10 @@ struct ChatWindowResolver {
         useCache: Bool = true,
         deepRecoveryEnabled: Bool = false,
         layoutMode: ChatWindowLayoutMode = .preserve,
-        interactionMode: ChatWindowInteractionMode = .allowUIAutomation
+        interactionMode: ChatWindowInteractionMode = .allowUIAutomation,
+        expectedTitle: String? = nil
     ) {
+        self.expectedTitle = expectedTitle
         self.kakao = kakao
         self.runner = runner
         self.useCache = useCache
@@ -102,6 +109,9 @@ struct ChatWindowResolver {
     }
 
     func resolve(query: String) throws -> ChatWindowResolution {
+        if let expectedTitle {
+            return try resolveStrict(expectedTitle: expectedTitle, chatID: nil)
+        }
         if interactionMode == .backgroundSafe {
             return try resolveExistingWindowOnly(query: query)
         }
@@ -123,6 +133,15 @@ struct ChatWindowResolver {
     func resolve(chatID: String) throws -> ChatWindowResolution {
         guard let record = ChatIdentityRegistryStore.shared.record(for: chatID) else {
             throw KakaoTalkError.elementNotFound("Unknown chat_id '\(chatID)'. Run 'kmsg chats' first to refresh the local registry.")
+        }
+
+        if let expectedTitle {
+            guard Self.isExactTitle(record.displayName, expectedTitle) else {
+                throw KakaoTalkError.actionFailed(
+                    "[\(ChatWindowFailureCode.targetMismatch.rawValue)] chat_id '\(chatID)' is '\(record.displayName)', not '\(expectedTitle)'"
+                )
+            }
+            return try resolveStrict(expectedTitle: expectedTitle, chatID: chatID)
         }
 
         if interactionMode == .backgroundSafe {
@@ -150,6 +169,213 @@ struct ChatWindowResolver {
         let chatWindow = try openChatViaSearch(query: query, in: searchWindow, fallbackWindow: usableWindow)
         standardizeReadableWindow(chatWindow, label: "opened chat window")
         return ChatWindowResolution(window: chatWindow, method: .openedViaSearch)
+    }
+
+    // MARK: - Strict target resolution
+
+    static func isExactTitle(_ candidate: String?, _ expected: String) -> Bool {
+        guard let candidate else { return false }
+        let trimmedExpected = expected.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !trimmedExpected.isEmpty
+            && candidate.trimmingCharacters(in: .whitespacesAndNewlines) == trimmedExpected
+    }
+
+    /// Windows whose title is exactly `expectedTitle`, excluding the chat list window.
+    func exactTitleChatWindows(_ expectedTitle: String) -> [UIElement] {
+        let listWindow = kakao.chatListWindow
+        return kakao.windows.filter { window in
+            if let listWindow, CFEqual(listWindow.axElement, window.axElement) {
+                return false
+            }
+            return Self.isExactTitle(window.title, expectedTitle)
+        }
+    }
+
+    private func resolveStrict(expectedTitle: String, chatID: String?) throws -> ChatWindowResolution {
+        guard interactionMode == .allowUIAutomation else {
+            throw KakaoTalkError.actionFailed("[\(ChatWindowFailureCode.backgroundSafeBlocked.rawValue)] strict target needs UI automation")
+        }
+        _ = try requireUsableWindow()
+
+        let existing = exactTitleChatWindows(expectedTitle)
+        if existing.count > 1 {
+            throw KakaoTalkError.actionFailed(
+                "[\(ChatWindowFailureCode.ambiguousTarget.rawValue)] \(existing.count) open windows are titled '\(expectedTitle)'; not sending"
+            )
+        }
+        if let window = existing.first {
+            runner.log("strict: using already open window titled exactly '\(expectedTitle)'")
+            return ChatWindowResolution(window: window, method: .existingWindow)
+        }
+
+        guard let chatListWindow = kakao.chatListWindow else {
+            throw KakaoTalkError.windowNotFound("[\(ChatWindowFailureCode.windowNotReady.rawValue)] chat list window not found")
+        }
+        // Titles only, recent rows first: the target is almost always near the top. Read deeper
+        // (and from the top) only when it is not there. chat_id checks need previews for the registry.
+        let withPreview = chatID != nil
+        func scanRows(_ limit: Int) -> [ChatListSnapshotItem] {
+            ChatListScanner().scan(in: chatListWindow, limit: limit, includePreview: withPreview, trace: { message in
+                runner.log(message)
+            })
+        }
+        func exactMatches(_ rows: [ChatListSnapshotItem]) -> [Int] {
+            rows.indices.filter { Self.isExactTitle(rows[$0].discovery.title, expectedTitle) }
+        }
+        var snapshots: [ChatListSnapshotItem] = []
+        var matching: [Int] = []
+        for attempt in 1...3 {
+            try showChatsTab(in: chatListWindow)
+            Thread.sleep(forTimeInterval: 0.3 * Double(attempt))
+            snapshots = scanRows(40)
+            matching = exactMatches(snapshots)
+            if matching.isEmpty, let anyRow = snapshots.first?.element {
+                scrollChatListToTop(containing: anyRow)
+                snapshots = scanRows(200)
+                matching = exactMatches(snapshots)
+            }
+            if !matching.isEmpty {
+                break
+            }
+            runner.log("strict: no exact row on attempt \(attempt); retrying tab switch")
+        }
+        guard matching.count == 1, let matchIndex = matching.first else {
+            throw KakaoTalkError.actionFailed(
+                "[\(ChatWindowFailureCode.ambiguousTarget.rawValue)] \(matching.count) chat list rows are titled '\(expectedTitle)' (need exactly 1); not sending"
+            )
+        }
+        if let chatID {
+            let assignedIDs = ChatIdentityRegistryStore.shared.assignChatIDs(for: snapshots.map(\.discovery))
+            guard assignedIDs[matchIndex] == chatID else {
+                throw KakaoTalkError.actionFailed(
+                    "[\(ChatWindowFailureCode.targetMismatch.rawValue)] row titled '\(expectedTitle)' is not chat_id '\(chatID)'; not sending"
+                )
+            }
+        }
+
+        kakao.activate()
+        _ = tryRaiseWindow(chatListWindow)
+        var row = snapshots[matchIndex].element
+        // A re-render can invalidate the row element (no frame); re-read the list for the same exact title.
+        for _ in 0..<3 where row.frame == nil {
+            Thread.sleep(forTimeInterval: 0.5)
+            let fresh = ChatListScanner().scan(in: chatListWindow, limit: 200, includePreview: withPreview)
+            let again = fresh.indices.filter { Self.isExactTitle(fresh[$0].discovery.title, expectedTitle) }
+            guard again.count == 1, let index = again.first else {
+                throw KakaoTalkError.actionFailed(
+                    "[\(ChatWindowFailureCode.ambiguousTarget.rawValue)] \(again.count) chat list rows are titled '\(expectedTitle)' on re-read (need exactly 1); not sending"
+                )
+            }
+            row = fresh[index].element
+            runner.log("strict: re-read row after stale element")
+        }
+        try openRowStrictly(row, in: chatListWindow, expectedTitle: expectedTitle)
+
+        var opened: [UIElement] = []
+        _ = runner.waitUntil(label: "strict chat window", timeout: 6.0, pollInterval: 0.1, evaluateAfterTimeout: true) {
+            opened = exactTitleChatWindows(expectedTitle)
+            return !opened.isEmpty
+        }
+        guard opened.count == 1, let window = opened.first else {
+            throw KakaoTalkError.windowNotFound(
+                "[\(ChatWindowFailureCode.windowNotReady.rawValue)] expected 1 window titled '\(expectedTitle)', found \(opened.count)"
+            )
+        }
+        standardizeReadableWindow(window, label: "opened chat window")
+        return ChatWindowResolution(window: window, method: .openedViaChatList)
+    }
+
+    /// Scroll the chat list until `row` is fully visible, confirm by hit-testing that the
+    /// point we will click belongs to that row, then double-click it.
+    private func openRowStrictly(_ row: UIElement, in chatListWindow: UIElement, expectedTitle: String) throws {
+        let container = ancestor(of: row, role: kAXScrollAreaRole)
+            ?? ancestor(of: row, role: kAXTableRole)
+            ?? ancestor(of: row, role: kAXOutlineRole)
+            ?? ancestor(of: row, role: kAXListRole)
+        guard let viewport = (container ?? chatListWindow).frame else {
+            throw KakaoTalkError.elementNotFound("[\(ChatWindowFailureCode.windowNotReady.rawValue)] chat list viewport not found")
+        }
+        let wheelPoint = CGPoint(x: viewport.midX, y: viewport.midY)
+        runner.log("strict: viewport role='\(container?.role ?? "window")' frame=\(viewport) row=\(row.frame.map { "\($0)" } ?? "nil")")
+        var visible = false
+        for _ in 0..<80 {
+            guard let rowFrame = row.frame else { break }
+            if rowFrame.minY >= viewport.minY && rowFrame.maxY <= viewport.maxY {
+                visible = true
+                break
+            }
+            // Positive wheel delta scrolls content down (toward the top of the list).
+            let delta: Int32 = rowFrame.minY < viewport.minY ? 3 : -3
+            if let event = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 1, wheel1: delta, wheel2: 0, wheel3: 0) {
+                event.location = wheelPoint
+                event.post(tap: .cghidEventTap)
+            }
+            Thread.sleep(forTimeInterval: 0.06)
+        }
+        guard visible, let rowFrame = row.frame else {
+            throw KakaoTalkError.actionFailed("[\(ChatWindowFailureCode.searchMiss.rawValue)] could not scroll the row titled '\(expectedTitle)' into view")
+        }
+
+        let point = CGPoint(x: rowFrame.midX, y: rowFrame.midY)
+        guard let hit = try? kakao.applicationElement.element(at: point), isSameOrDescendant(hit, of: row) else {
+            throw KakaoTalkError.actionFailed("[\(ChatWindowFailureCode.targetMismatch.rawValue)] the point to click is not on the row titled '\(expectedTitle)'; not opening")
+        }
+        kakao.activate()
+        _ = tryRaiseWindow(chatListWindow)
+        Thread.sleep(forTimeInterval: 0.1)
+        runner.mouseDoubleClick(at: point, label: "strict chat list row")
+    }
+
+    /// The main window may be on the Friends tab; strict lookups must read the chat list.
+    private func showChatsTab(in chatListWindow: UIElement) throws {
+        guard let tab = chatListWindow.findFirst(identifier: "chatrooms") else {
+            throw KakaoTalkError.elementNotFound("[\(ChatWindowFailureCode.windowNotReady.rawValue)] chats tab button not found")
+        }
+        kakao.activate()
+        _ = tryRaiseWindow(chatListWindow)
+        if supportsAction("AXPress", on: tab) {
+            try? tab.press()
+        } else if let frame = tab.frame {
+            runner.mouseDoubleClick(at: CGPoint(x: frame.midX, y: frame.midY), label: "chats tab")
+        }
+        Thread.sleep(forTimeInterval: 0.5)
+        runner.log("strict: switched to chats tab")
+    }
+
+    private func scrollChatListToTop(containing row: UIElement) {
+        guard let viewport = (ancestor(of: row, role: kAXScrollAreaRole) ?? ancestor(of: row, role: kAXTableRole))?.frame else { return }
+        let wheelPoint = CGPoint(x: viewport.midX, y: viewport.midY)
+        runner.log("strict: scrolling chat list to top")
+        for _ in 0..<60 {
+            if let event = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 1, wheel1: 30, wheel2: 0, wheel3: 0) {
+                event.location = wheelPoint
+                event.post(tap: .cghidEventTap)
+            }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        Thread.sleep(forTimeInterval: 0.3)
+    }
+
+    private func ancestor(of element: UIElement, role: String) -> UIElement? {
+        var cursor = element.parent
+        var hops = 0
+        while let current = cursor, hops < 12 {
+            if current.role == role { return current }
+            cursor = current.parent
+            hops += 1
+        }
+        return nil
+    }
+
+    private func isSameOrDescendant(_ element: UIElement, of ancestorElement: UIElement) -> Bool {
+        var cursor: UIElement? = element
+        var hops = 0
+        while let current = cursor, hops < 12 {
+            if CFEqual(current.axElement, ancestorElement.axElement) { return true }
+            cursor = current.parent
+            hops += 1
+        }
+        return false
     }
 
     @discardableResult

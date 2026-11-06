@@ -22,6 +22,18 @@ struct SendCommand: ParsableCommand {
     @Argument(help: "Message to send when recipient is provided")
     var secondValue: String?
 
+    @Option(
+        name: .long,
+        help: "Strict mode: send only to the one chat titled exactly this. Ambiguity or mismatch aborts; the title is re-checked right before typing and right before Enter."
+    )
+    var expectTitle: String?
+
+    @Option(
+        name: .long,
+        help: "Strict mode (with --expect-title): a recent message of the target chat, e.g. from the local DB. Repeatable. Every one must appear in the opened window's transcript, checked right before typing and right before Enter."
+    )
+    var expectRecent: [String] = []
+
     @Flag(name: .long, help: "Don't actually send, just show what would happen")
     var dryRun: Bool = false
 
@@ -47,6 +59,7 @@ struct SendCommand: ParsableCommand {
     var deepRecovery: Bool = false
 
     private enum SendFailureCode: String {
+        case targetMismatch = "TARGET_MISMATCH"
         case focusFail = "FOCUS_FAIL"
         case inputNotReflected = "INPUT_NOT_REFLECTED"
         case enterNotEffective = "ENTER_NOT_EFFECTIVE"
@@ -73,6 +86,9 @@ struct SendCommand: ParsableCommand {
     }
 
     func validate() throws {
+        if !expectRecent.isEmpty && expectTitle == nil {
+            throw ValidationError("--expect-recent requires --expect-title.")
+        }
         if let chatID, !chatID.isEmpty {
             guard let firstValue, !firstValue.isEmpty else {
                 throw ValidationError("Message is required when using --chat-id.")
@@ -100,6 +116,12 @@ struct SendCommand: ParsableCommand {
                 print("Recipient: \(recipient ?? "")")
             }
             print("Message: \(message)")
+            if let expectTitle {
+                print("Expect title: \(expectTitle)")
+            }
+            if !expectRecent.isEmpty {
+                print("Expect recent messages: \(expectRecent.count)")
+            }
             if keepWindow {
                 print("Option: keep auto-opened window")
             }
@@ -119,9 +141,11 @@ struct SendCommand: ParsableCommand {
             kakao: kakao,
             runner: runner,
             useCache: !noCache,
-            deepRecoveryEnabled: deepRecovery
+            deepRecoveryEnabled: deepRecovery,
+            expectedTitle: expectTitle
         )
 
+        var openedResolution: ChatWindowResolution?
         do {
             runner.log("window strategy: focusedWindow -> mainWindow -> windows.first")
             let resolution: ChatWindowResolution
@@ -137,13 +161,16 @@ struct SendCommand: ParsableCommand {
                 let recipient = recipient ?? ""
                 print("Looking for chat with \(targetDescription)...")
                 resolution = try chatWindowResolver.resolve(query: recipient)
-                if resolution.openedTransiently {
+                if resolution.method == .openedViaChatList {
+                    print("No existing chat window. Opened via chat list.")
+                } else if resolution.openedTransiently {
                     print("No existing chat window. Opening via search...")
                 } else {
                     print("Found existing chat window.")
                 }
             }
 
+            openedResolution = resolution
             try sendMessageToWindow(resolution.window, kakao: kakao, runner: runner)
             closeWindowsIfNeeded(
                 resolution: resolution,
@@ -153,6 +180,10 @@ struct SendCommand: ParsableCommand {
             )
         } catch {
             print("Failed to send message: \(error)")
+            // Strict mode: do not leave a window we opened for an aborted send.
+            if expectTitle != nil, !keepWindow, let openedResolution, openedResolution.openedTransiently {
+                _ = chatWindowResolver.closeWindow(openedResolution.window)
+            }
             throw ExitCode.failure
         }
     }
@@ -263,7 +294,12 @@ struct SendCommand: ParsableCommand {
         _ = tryRaiseWindow(window, runner: runner)
         Thread.sleep(forTimeInterval: 0.1)
 
+        try verifyTarget(window, kakao: kakao, stage: "before typing", input: nil)
+
         guard let input = resolveMessageInputField(chatWindow: window, kakao: kakao, runner: runner) else {
+            if expectTitle != nil {
+                throw KakaoTalkError.actionFailed("[\(SendFailureCode.forcedTypingFailed.rawValue)] Message input field not found; strict mode never force-types")
+            }
             let forcedTyped = forceTypeIntoChatWindow(chatWindow: window, kakao: kakao, runner: runner)
             guard forcedTyped else {
                 throw KakaoTalkError.actionFailed("[\(SendFailureCode.forcedTypingFailed.rawValue)] Message input field not found and forced typing fallback failed")
@@ -281,6 +317,33 @@ struct SendCommand: ParsableCommand {
             runner.typeTextWithVerification(message, on: input, label: "message input", attempts: 2)
         guard inputReady else {
             throw KakaoTalkError.actionFailed("[\(SendFailureCode.inputNotReflected.rawValue)] Message input was not reflected")
+        }
+
+        do {
+            try pressEnterStrictly(window: window, input: input, kakao: kakao, runner: runner)
+        } catch {
+            _ = runner.setTextWithVerification("", on: input, label: "message input clear", attempts: 1)
+            throw error
+        }
+        print("✓ Message sent to \(targetDescription)")
+    }
+
+    /// Verify the target, then press Enter. In strict mode the transcript read can
+    /// take seconds and move focus, so focus returns to the input and the cheap
+    /// window checks run once more immediately before Enter.
+    private func pressEnterStrictly(window: UIElement, input: UIElement, kakao: KakaoTalkApp, runner: AXActionRunner) throws {
+        if expectTitle != nil {
+            try verifyTarget(window, kakao: kakao, stage: "before Enter", input: input)
+            kakao.activate()
+            _ = tryRaiseWindow(window, runner: runner)
+            guard runner.focusWithVerification(input, label: "message input refocus", attempts: 2) else {
+                throw KakaoTalkError.actionFailed("[\(SendFailureCode.focusFail.rawValue)] Could not refocus message input")
+            }
+            try verifyTarget(window, kakao: kakao, stage: "at Enter", input: input, includeTranscript: false)
+            let current = (input.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard current == message.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                throw KakaoTalkError.actionFailed("[\(SendFailureCode.inputNotReflected.rawValue)] input no longer holds exactly the message")
+            }
         }
 
         var sendSucceeded = runner.pressEnterWithVerification(
@@ -305,8 +368,20 @@ struct SendCommand: ParsableCommand {
             invalidateCachedSlots([.messageInput], runner: runner)
             throw KakaoTalkError.actionFailed("[\(SendFailureCode.enterNotEffective.rawValue)] Enter key had no visible effect")
         }
+    }
 
-        print("✓ Message sent to \(targetDescription)")
+    /// Strict mode: the chat window must still be titled exactly `expectTitle`, be the
+    /// focused window, and (once known) own the message input. Anything else aborts.
+    private func verifyTarget(
+        _ window: UIElement,
+        kakao: KakaoTalkApp,
+        stage: String,
+        input: UIElement?,
+        includeTranscript: Bool = true
+    ) throws {
+        guard let expectTitle else { return }
+        try StrictTargetCheck(expectTitle: expectTitle, expectRecent: expectRecent, traceAX: traceAX)
+            .verify(window, kakao: kakao, stage: stage, input: input, includeTranscript: includeTranscript)
     }
 
     private func closeWindowsIfNeeded(
