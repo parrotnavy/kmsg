@@ -333,7 +333,7 @@ struct SendCommand: ParsableCommand {
     /// window checks run once more immediately before Enter.
     private func pressEnterStrictly(window: UIElement, input: UIElement, kakao: KakaoTalkApp, runner: AXActionRunner) throws {
         if expectTitle != nil {
-            try verifyTarget(window, kakao: kakao, stage: "before Enter", input: input)
+            try verifyTarget(window, kakao: kakao, stage: "before Enter", input: input, newestOnly: true)
             kakao.activate()
             _ = tryRaiseWindow(window, runner: runner)
             guard runner.focusWithVerification(input, label: "message input refocus", attempts: 2) else {
@@ -377,11 +377,12 @@ struct SendCommand: ParsableCommand {
         kakao: KakaoTalkApp,
         stage: String,
         input: UIElement?,
-        includeTranscript: Bool = true
+        includeTranscript: Bool = true,
+        newestOnly: Bool = false
     ) throws {
         guard let expectTitle else { return }
         try StrictTargetCheck(expectTitle: expectTitle, expectRecent: expectRecent, traceAX: traceAX)
-            .verify(window, kakao: kakao, stage: stage, input: input, includeTranscript: includeTranscript)
+            .verify(window, kakao: kakao, stage: stage, input: input, includeTranscript: includeTranscript, newestOnly: newestOnly)
     }
 
     private func closeWindowsIfNeeded(

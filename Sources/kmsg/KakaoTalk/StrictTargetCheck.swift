@@ -17,7 +17,8 @@ struct StrictTargetCheck {
         stage: String,
         input: UIElement? = nil,
         attachedSheet: UIElement? = nil,
-        includeTranscript: Bool = true
+        includeTranscript: Bool = true,
+        newestOnly: Bool = false
     ) throws {
         let fail = { (reason: String) -> KakaoTalkError in
             KakaoTalkError.actionFailed("[TARGET_MISMATCH] \(stage): \(reason); not sending")
@@ -52,11 +53,14 @@ struct StrictTargetCheck {
                 throw fail("message input does not belong to the target chat window")
             }
         }
-        if includeTranscript && !expectRecent.isEmpty {
+        // After a long message is typed the input grows and pushes older rows out of view,
+        // so the check right before Enter only needs the newest expected message.
+        let expected = newestOnly ? Array(expectRecent.prefix(1)) : expectRecent
+        if includeTranscript && !expected.isEmpty {
             // Only the newest messages matter: read a short tail first, then a longer one before giving up
             // (a photo row or a window not scrolled to the bottom can push them out of the short tail).
             let reader = KakaoTalkTranscriptReader(kakao: kakao, runner: AXActionRunner(traceEnabled: traceAX))
-            var missing = expectRecent
+            var missing = expected
             var bodyCount = 0
             var lastError: Error?
             for limit in [8, 16] {
@@ -67,8 +71,8 @@ struct StrictTargetCheck {
                 }
                 let bodies = snapshot.messages.map { Self.normalizeForMatch($0.body) }.filter { !$0.isEmpty }
                 bodyCount = bodies.count
-                missing = expectRecent.filter { expected in
-                    let want = Self.normalizeForMatch(expected)
+                missing = expected.filter { candidate in
+                    let want = Self.normalizeForMatch(candidate)
                     return !bodies.contains { body in
                         body == want || body.contains(want) || (body.count >= 8 && want.hasPrefix(body))
                     }
@@ -79,9 +83,9 @@ struct StrictTargetCheck {
                 throw fail("could not read the chat transcript (\(lastError))")
             }
             guard missing.isEmpty else {
-                throw fail("\(missing.count) of \(expectRecent.count) expected recent messages are not in the window transcript (\(bodyCount) messages read)")
+                throw fail("\(missing.count) of \(expected.count) expected recent messages are not in the window transcript (\(bodyCount) messages read)")
             }
-            print("✓ Transcript matches \(expectRecent.count) expected recent message(s) \(stage)")
+            print("✓ Transcript matches \(expected.count) expected recent message(s) \(stage)")
         }
         print("✓ Target verified \(stage): '\(expectTitle)'")
     }
